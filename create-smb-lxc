@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Run on a Proxmox VE host as root. Mounts one SMB share and binds it to one LXC.
+error() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+info() { printf '\n==> %s\n' "$*"; }
+[[ $EUID -eq 0 ]] || error 'Run this script as root on the Proxmox host.'
+command -v pct >/dev/null || error 'pct not found. Run on the Proxmox host.'
+command -v mount.cifs >/dev/null || error 'Install SMB support first: apt update && apt install -y cifs-utils'
+command -v systemd-escape >/dev/null || error 'systemd-escape not found.'
+
+read -r -p 'LXC container ID (e.g. 1070): ' CTID
+[[ "$CTID" =~ ^[0-9]+$ ]] || error 'Invalid container ID.'
+pct config "$CTID" >/dev/null 2>&1 || error "LXC $CTID does not exist."
+
+read -r -p 'SMB share (e.g. //192.168.1.4/Movies): ' SHARE
+[[ "$SHARE" =~ ^//[^/[:space:]]+/[^/[:space:]]+$ ]] || error 'Use //server/share, without spaces.'
+
+read -r -p 'New mount location, both host and LXC (e.g. /mnt/nas_movies): ' MOUNTPOINT
+[[ "$MOUNTPOINT" =~ ^/mnt/[a-zA-Z0-9_.-]+$ ]] || error 'Use a single new folder under /mnt (letters/numbers/._- only).'
+[[ ! -L "$MOUNTPOINT" ]] || error 'Mountpoint cannot be a symlink.'
+[[ ! -e "$MOUNTPOINT" ]] || error 'Mount location already exists; choose a new unused folder to avoid hiding data.'
+
+read -r -p 'SMB username: ' SMB_USER
+[[ -n "$SMB_USER" && "$SMB_USER" != *$'\n'* && "$SMB_USER" != *$'\r'* ]] || error 'Invalid username.'
+read -r -s -p 'SMB password (hidden): ' SMB_PASS
+printf '\n'
+[[ -n "$SMB_PASS" && "$SMB_PASS" != *$'\n'* && "$SMB_PASS" != *$'\r'* ]] || error 'Invalid password.'
+
+# Default unprivileged LXCs map container root -> host 100000.
+UNPRIV="$(pct config "$CTID" | awk '/^unprivileged:/ {print $2}')"
+[[ "$UNPRIV" == 1 ]] || error 'This script is intentionally limited to unprivileged LXCs.'
+if pct config "$CTID" | grep -q '^lxc.idmap:'; then
+  error 'Custom lxc.idmap detected. Adapt UID/GID mapping manually first.'
+fi
+
+if grep -Fq "$SHARE " /etc/fstab || grep -Eq "^[^#[:space:]]+[[:space:]]+${MOUNTPOINT//\//\\/}[[:space:]]" /etc/fstab; then
+  error 'Share or mount location already appears in /etc/fstab. Review it before continuing.'
+fi
+if pct config "$CTID" | grep -Eq "^mp[0-9]+:.*mp=$MOUNTPOINT([,[:space:]]|$)"; then
+  error 'Container already has a mount at that path.'
+fi
+
+SLOT=''
+for i in $(seq 0 255); do
+  if ! pct config "$CTID" | grep -q "^mp${i}:"; then SLOT="mp$i"; break; fi
+done
+[[ -n "$SLOT" ]] || error 'No free LXC mountpoint slots.'
+
+SAFE_ID="${SHARE#//}"
+SAFE_ID="${SAFE_ID//\//_}"
+SAFE_ID="$(printf '%s' "$SAFE_ID" | tr -c 'a-zA-Z0-9_.-' '_')"
+CRED="/root/.smbcredentials-${SAFE_ID}"
+[[ ! -e "$CRED" ]] || error "Credential file $CRED already exists; refusing to overwrite."
+
+printf '\nShare:      %s\nHost/LXC:   %s\nContainer:  %s\nLXC slot:   %s\nCredentials: %s\n' "$SHARE" "$MOUNTPOINT" "$CTID" "$SLOT" "$CRED"
+read -r -p 'Proceed with mounting and configuring this share? [y/N]: ' CONFIRM
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo 'Cancelled; no changes made.'; exit 0; }
+
+umask 077
+# Write credentials without exposing password on the command line.
+printf 'username=%s\npassword=%s\n' "$SMB_USER" "$SMB_PASS" > "$CRED"
+chmod 600 "$CRED"
+unset SMB_PASS
+
+mkdir -p "$MOUNTPOINT"
+# Test the share before making a persistent change.
+info 'Testing SMB mount on Proxmox host...'
+if ! mount -t cifs "$SHARE" "$MOUNTPOINT" -o "credentials=$CRED,vers=3.0,uid=100000,gid=100000,file_mode=0664,dir_mode=0775"; then
+  rmdir "$MOUNTPOINT" 2>/dev/null || true
+  error 'SMB mount failed. Check NAS credentials, share permissions and network. No fstab/LXC changes were made.'
+fi
+if [[ "$(findmnt -n -o FSTYPE --target "$MOUNTPOINT")" != cifs ]]; then
+  umount "$MOUNTPOINT" || true
+  error 'Mount verification did not report CIFS.'
+fi
+
+info 'Adding persistent mount to /etc/fstab...'
+cp -a /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d-%H%M%S)"
+printf '%s %s cifs credentials=%s,vers=3.0,uid=100000,gid=100000,file_mode=0664,dir_mode=0775,_netdev,nofail,x-systemd.automount 0 0\n' \
+  "$SHARE" "$MOUNTPOINT" "$CRED" >> /etc/fstab
+systemctl daemon-reload
+# The mount is already active; the automount unit is installed for future boots.
+
+info "Configuring LXC $CTID ($SLOT)..."
+pct set "$CTID" "-$SLOT" "$MOUNTPOINT,mp=$MOUNTPOINT"
+
+echo
+printf 'SUCCESS: %s mounted at %s on host and configured as %s for LXC %s.\n' "$SHARE" "$MOUNTPOINT" "$SLOT" "$CTID"
+echo 'The share is mounted now; fstab will restore it after a host reboot.'
+
+if [[ "$(pct status "$CTID" | awk '{print $2}')" == running ]]; then
+  echo "LXC $CTID is running. A restart is needed to apply the bind mount."
+  echo 'Restarting will interrupt ALL Docker containers inside this LXC.'
+  read -r -p "Stop and start LXC $CTID now? [y/N]: " RESTART
+  if [[ "$RESTART" =~ ^[Yy]$ ]]; then
+    pct stop "$CTID"
+    pct start "$CTID"
+    pct exec "$CTID" -- ls -ld "$MOUNTPOINT"
+  else
+    echo "Restart later from the Proxmox host: pct stop $CTID && pct start $CTID"
+  fi
+else
+  echo "Start LXC when ready: pct start $CTID"
+fi
+
+echo
+printf 'Verify on host: findmnt %s\n' "$MOUNTPOINT"
+printf 'Verify in LXC: pct exec %s -- ls -lah %s\n' "$CTID" "$MOUNTPOINT"
+echo 'For Docker Compose, explicitly bind this LXC path into each desired service (e.g., /mnt/nas_movies:/media/movies:ro).'
